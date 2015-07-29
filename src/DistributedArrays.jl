@@ -33,7 +33,7 @@ dfill(v, args...) = DArray(I->fill(v, map(length,I)), args...)
 """ ->
 type DArray{T,N,A} <: AbstractArray{T,N}
     dims::NTuple{N,Int}
-    chunks::Array{RemoteRef,N}
+    chunks::Array{RegisteredRef,N}
     pids::Array{Int,N}                          # pids[i]==p ⇒ processor p has piece i
     indexes::Array{NTuple{N,UnitRange{Int}},N}  # indexes held by piece i
     cuts::Vector{Vector{Int}}                   # cuts[d][i] = first index of chunk i in dimension d
@@ -61,9 +61,11 @@ function DArray(init, dims, procs, dist)
     np = prod(dist)
     procs = procs[1:np]
     idxs, cuts = chunk_idxs([dims...], dist)
-    chunks = Array(RemoteRef, dist...)
-    for i = 1:np
-        chunks[i] = remotecall(procs[i], init, idxs[i])
+    chunks = Array(RegisteredRef, dist...)
+    @sync for i = 1:np
+        @async begin
+            chunks[i] = remotecall_fetch(procs[i], I->(c=RegisteredRef(sz=1);put!(c, init(I)); c), idxs[i])
+        end
     end
 
     return construct_darray(dims, chunks, procs, idxs, cuts)
@@ -87,7 +89,7 @@ DArray(init, dims) = DArray(init, dims, workers()[1:min(nworkers(), maximum(dims
 DArray(init, d::DArray) = DArray(init, size(d), procs(d), [size(d.chunks)...])
 
 # Create a DArray from a collection of references
-function DArray(refs::Array{RemoteRef})
+function DArray(refs::Array{RegisteredRef})
     dimdist = size(refs)
 
     npids = [r.where for r in refs]
@@ -324,10 +326,10 @@ Convert a local array to distributed.
 function distribute(A::AbstractArray;
                     procs=workers()[1:min(nworkers(), maximum(size(A)))])
     owner = myid()
-    rr = RemoteRef()
+    rr = RegisteredRef()
     put!(rr, A)
     d = DArray(size(A), procs) do I
-        remotecall_fetch(owner, ()->fetch(rr)[I...])
+        remotecall_fetch(owner, ()->(rr)[I...])
     end
     # Ensure that all workers have fetched their localparts.
     # Else a gc in between can recover the RemoteRef rr
@@ -689,7 +691,12 @@ function mapslices{T,N}(f::Function, D::DArray{T,N}, dims::AbstractVector)
         end
     end
 
-    refs = RemoteRef[remotecall(p, (x,y,z)->mapslices(x,localpart(y),z), f, D, dims) for p in procs(D)]
+    refs = Array(RegisteredRef, length(procs(D)))
+    @sync begin
+        for (idx,p) in enumerate(procs(D))
+            @async refs[idx] = remotecall_fetch(p, (x,y,z)->(c=RegisteredRef(sz=1); put!(c, mapslices(x,localpart(y),z)); c), f, D, dims)
+        end
+    end
 
     DArray(reshape(refs, size(procs(D))))
 end
@@ -800,7 +807,13 @@ function ppeval(f, D...; dim::NTuple = map(t -> isa(t, DArray) ? ndims(t) : 0, D
         end
     end
 
-    refs = RemoteRef[remotecall(p, (x, y, z) -> _ppeval(x, map(localpart, y)...; dim = z), f, D, dim) for p in procs(D[1])]
+    refs = Array(RegisteredRef, length(procs(D[1])))
+    @sync begin
+        for (idx,p) in enumerate(procs(D[1]))
+            @async refs[idx] = remotecall_fetch(p, (x,y,z)->(c=RegisteredRef(sz=1); put!(c, _ppeval(x, map(localpart, y)...; dim = z)); c), f, D, dim)
+        end
+    end
+#    refs = RemoteRef[remotecall(p, (x, y, z) -> _ppeval(x, map(localpart, y)...; dim = z), f, D, dim) for p in procs(D[1])]
 
     # The array of RemoteRefs has to be reshaped for the DArray constructor to work correctly.
     # This requires a fetch and the DArray is also fetching so it might be better to modify
@@ -831,7 +844,7 @@ function dot(x::DVector, y::DVector)
     if (procs(x) != procs(y)) || (x.cuts != y.cuts)
         throw(ArgumentError("vectors don't have the same distribution. Not handled for efficiency reasons."))
     end
-    r = RemoteRef[]
+    r = Future[]
     for i = eachindex(x.chunks)
         cx, cy = x.chunks[i], y.chunks[i]
         push!(r, remotecall(cx.where, () -> dot(fetch(cx), fetch(cy))))
@@ -875,7 +888,7 @@ function A_mul_B!(α::Number, A::DMatrix, x::AbstractVector, β::Number, y::DVec
     end
 
     # Multiply on each tile of A
-    R = Array(RemoteRef, size(A.chunks)...)
+    R = Array(Future, size(A.chunks)...)
     for j = 1:size(A.chunks, 2)
         xj = x[A.cuts[2][j]:A.cuts[2][j + 1] - 1]
         for i = 1:size(A.chunks, 1)
@@ -917,7 +930,7 @@ function Ac_mul_B!(α::Number, A::DMatrix, x::AbstractVector, β::Number, y::DVe
     end
 
     # Multiply on each tile of A
-    R = Array(RemoteRef, reverse(size(A.chunks))...)
+    R = Array(Future, reverse(size(A.chunks))...)
     for j = 1:size(A.chunks, 1)
         xj = x[A.cuts[1][j]:A.cuts[1][j + 1] - 1]
         for i = 1:size(A.chunks, 2)
@@ -960,7 +973,7 @@ function A_mul_B!(α::Number, A::DMatrix, B::AbstractMatrix, β::Number, C::DMat
     end
 
     # Multiply on each tile of A
-    R = Array(RemoteRef, size(procs(A))..., size(procs(C), 2))
+    R = Array(Future, size(procs(A))..., size(procs(C), 2))
     for j = 1:size(A.chunks, 2)
         for k = 1:size(C.chunks, 2)
             Bjk = B[A.cuts[2][j]:A.cuts[2][j + 1] - 1, C.cuts[2][k]:C.cuts[2][k + 1] - 1]
@@ -1016,11 +1029,11 @@ function Ac_mul_B!(α::Number, A::DMatrix, B::AbstractMatrix, β::Number, C::DMa
     end
 
     # Multiply on each tile of A
-    R = Array(RemoteRef, reverse(size(procs(A)))..., size(procs(C), 2))
+    R = Array(Future, reverse(size(procs(A)))..., size(procs(C), 2))
     for j = 1:size(A.chunks, 1)
         for k = 1:size(C.chunks, 2)
             Bjk = B[A.cuts[1][j]:A.cuts[1][j + 1] - 1, C.cuts[2][k]:C.cuts[2][k + 1] - 1]
-            for i = 1:size(A.chunks, 2)
+            @sync for i = 1:size(A.chunks, 2)
                 R[i,j,k] = remotecall(procs(A)[j,i], () -> localpart(A)'*convert(localtype(B), Bjk))
             end
         end
