@@ -51,6 +51,39 @@ end
 
 check_leaks()
 
+facts("test DArray similar") do
+    D = drand((200,200), [MYID, OTHERIDS])
+    DS = similar(D,Float16)
+
+    context("test eltype of a similar") do
+        @fact eltype(DS) == Float16 --> true
+    end
+    
+    context("test dims of a similar") do
+        @fact size(D) == size(DS) --> true
+    end
+    close(D)
+    close(DS)
+end
+
+check_leaks()
+
+facts("test DArray reshape") do
+    D = drand((200,200), [MYID, OTHERIDS])
+
+    context("Test error-throwing in reshape") do
+        @fact_throws DimensionMismatch reshape(D,(100,100))
+    end
+
+    DR = reshape(D,(100,400))
+    context("Test reshape") do
+        @fact size(DR) == (100,400) --> true
+    end
+    close(D)
+end
+
+check_leaks()
+
 facts("test @DArray comprehension constructor") do
 
     context("test valid use of @DArray") do
